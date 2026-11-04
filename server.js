@@ -1,10 +1,44 @@
-const http = require('http');
+// Sandal Royale: serves the game (from game.zip) and relays room messages between players (WebSocket) - one service, one link.
+const http = require('http'), fs = require('fs'), path = require('path'), zlib = require('zlib');
 const { WebSocketServer } = require('ws');
-const rooms = new Map();
-let nextId = 1;
+const PUB = path.join(__dirname, 'public');
+// ---- minimal unzip (no dependencies) ----
+function unzip(file, out) {
+  const b = fs.readFileSync(file); let e = b.length - 22; while (e > 0 && b.readUInt32LE(e) !== 0x06054b50) e--;
+  const n = b.readUInt16LE(e + 10); let p = b.readUInt32LE(e + 16);
+  for (let i = 0; i < n; i++) {
+    const method = b.readUInt16LE(p + 10), csize = b.readUInt32LE(p + 20), nl = b.readUInt16LE(p + 28), el = b.readUInt16LE(p + 30), cl = b.readUInt16LE(p + 32), off = b.readUInt32LE(p + 42);
+    const name = b.toString('utf8', p + 46, p + 46 + nl); p += 46 + nl + el + cl;
+    if (name.endsWith('/')) continue;
+    const lh = off + 30 + b.readUInt16LE(off + 26) + b.readUInt16LE(off + 28), raw = b.subarray(lh, lh + csize);
+    const data = method === 0 ? raw : zlib.inflateRawSync(raw), dest = path.join(out, name);
+    fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, data);
+  }
+}
+if (!fs.existsSync(path.join(PUB, 'index.html')) && fs.existsSync(path.join(__dirname, 'game.zip'))) unzip(path.join(__dirname, 'game.zip'), PUB);
+// the character is stored once (.glb) and served as the 4 base64 parts the game loads
+let parts = null;
+function getParts() {
+  if (parts) return parts;
+  const f = path.join(PUB, 'assets', 'sandal_character_v2.glb'); if (!fs.existsSync(f)) return (parts = []);
+  const s = fs.readFileSync(f).toString('base64'), n = 4; parts = [];
+  for (let i = 0; i < n; i++) parts.push(Buffer.from(s.slice(i * 5301500, i === n - 1 ? s.length : (i + 1) * 5301500)));
+  return parts;
+}
+const TYPES = { '.html': 'text/html; charset=utf-8', '.jpg': 'image/jpeg', '.png': 'image/png', '.txt': 'text/plain', '.js': 'text/javascript' };
+const rooms = new Map(); let nextId = 1;
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'content-type': 'text/plain', 'access-control-allow-origin': '*' });
-  res.end('Sandal Royale server OK. rooms=' + rooms.size);
+  const u = decodeURIComponent((req.url || '/').split('?')[0]);
+  let buf = null, type = 'text/plain';
+  const m = /^\/assets\/sandal_character\.b64\.(\d)\.txt$/.exec(u);
+  if (m) { buf = getParts()[+m[1]]; type = TYPES['.txt']; }
+  else if (u === '/health') { buf = Buffer.from('ok rooms=' + rooms.size); }
+  else {
+    const rel = u === '/' ? 'index.html' : u.replace(/^\/+/, ''), f = path.join(PUB, rel);
+    if (f.startsWith(PUB) && fs.existsSync(f) && fs.statSync(f).isFile()) { buf = fs.readFileSync(f); type = TYPES[path.extname(f)] || 'application/octet-stream'; }
+  }
+  if (!buf) { res.writeHead(404, { 'content-type': 'text/plain' }); return res.end('not found'); }
+  res.writeHead(200, { 'content-type': type, 'cache-control': 'public, max-age=3600' }); res.end(buf);
 });
 const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
 const code = () => { const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; let s; do { s = ''; for (let i = 0; i < 4; i++) s += c[Math.random() * c.length | 0]; } while (rooms.has(s)); return s; };
