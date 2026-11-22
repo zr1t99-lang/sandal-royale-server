@@ -36,6 +36,15 @@ function getParts() {
 const gz = new Map();   // gzip cache for text files
 const TYPES = { '.html': 'text/html; charset=utf-8', '.jpg': 'image/jpeg', '.png': 'image/png', '.txt': 'text/plain; charset=utf-8', '.js': 'text/javascript', '.json': 'application/json' };
 const MODES = ['classic', 'hot', 'rain', 'gold'];
+// MOVED_TO (set only on an old address): the home page forwards players to the new address and hands over the profile saved
+// on this site (progress, coins, friend code, friends), since a phone keeps saved data separately for every web address.
+const MOVED_TO = (process.env.MOVED_TO || '').replace(/\/+$/, '');
+const movedPage = () => Buffer.from(`<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sandal Royale</title>
+<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;text-align:center;background:#2b1838;color:#ffe9a8;font:700 20px system-ui,sans-serif">
+<div>ننقلك لسيرفر أسرع…<br><br><a id="a" style="color:#fff;font-size:16px" href="${MOVED_TO}/">اضغط هنا إذا ما انتقلت</a></div>
+<script>(function(){var d={},n=0;try{["sr_profile","sr_name"].forEach(function(k){var v=localStorage.getItem(k);if(v){d[k]=v;n++;}});}catch(e){}
+var u=${JSON.stringify(MOVED_TO)}+"/"+location.search;try{if(n)u+="#mig="+encodeURIComponent(btoa(unescape(encodeURIComponent(JSON.stringify(d)))));}catch(e){}
+document.getElementById("a").href=u;location.replace(u);})();</script>`);
 const rooms = new Map(), seats = new Map(); let nextId = 1;
 const server = http.createServer((req, res) => {
   const u = decodeURIComponent((req.url || '/').split('?')[0]);
@@ -44,6 +53,7 @@ const server = http.createServer((req, res) => {
   if (m) { buf = getParts()[+m[1]]; type = TYPES['.txt']; }
   else if (u === '/health') { buf = Buffer.from('ok v' + VERSION + ' rooms=' + rooms.size + ' online=' + wss.clients.size); key = null; }
   else if (u === '/stats') { buf = Buffer.from(JSON.stringify(stats())); type = TYPES['.json']; key = null; }
+  else if (MOVED_TO && (u === '/' || u === '/index.html')) { buf = movedPage(); type = TYPES['.html']; key = null; }
   else {
     const rel = u === '/' ? 'index.html' : u.replace(/^\/+/, ''), f = path.join(PUB, rel);
     if (f.startsWith(PUB) && fs.existsSync(f) && fs.statSync(f).isFile()) { buf = fs.readFileSync(f); type = TYPES[path.extname(f)] || 'application/octet-stream'; }
@@ -182,4 +192,4 @@ wss.on('connection', ws => {
   });
 });
 setInterval(() => { wss.clients.forEach(w => { if (!w.alive) return w.terminate(); w.alive = false; w.ping(); }); }, 25000);
-server.listen(process.env.PORT || 8080, () => console.log('Sandal Royale server v' + VERSION + ' listening'));
+server.listen(process.env.PORT || 8080, () => console.log('Sandal Royale server v' + VERSION + ' listening' + (MOVED_TO ? ' (home page forwards to ' + MOVED_TO + ')' : '')));
