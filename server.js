@@ -3,10 +3,12 @@
 //  - private rooms with a 4-letter code; the host picks the mode and starts
 //  - relay of in-match messages (each client is authoritative for its own fighter; the room host for shared mode state)
 //  - resume: a dropped connection can re-attach to its seat within 20 s (mobile network hiccups)
+//  - friends: each player has a 6-letter code (generated on the phone). Friend lists live on the phones; the server only
+//    routes friend requests / accepts (kept in memory until delivered), answers presence and delivers party invites.
 const http = require('http'), fs = require('fs'), path = require('path'), zlib = require('zlib'), crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const PUB = path.join(__dirname, 'public');
-const VERSION = 2;
+const VERSION = 3;
 // ---- minimal unzip (no dependencies) ----
 function unzip(file, out) {
   const b = fs.readFileSync(file); let e = b.length - 22; while (e > 0 && b.readUInt32LE(e) !== 0x06054b50) e--;
@@ -57,7 +59,13 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server, maxPayload: 32 * 1024 });
 const newCode = () => { const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; let s; do { s = ''; for (let i = 0; i < 4; i++) s += c[Math.random() * c.length | 0]; } while (rooms.has(s)); return s; };
 const send = (ws, o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
-const listOf = r => [...r.players.values()].map(p => ({ id: p.id, name: p.name, on: !p.gone }));
+const listOf = r => [...r.players.values()].map(p => ({ id: p.id, name: p.name, on: !p.gone, uid: p.uid || '', lv: p.lv || 1, look: p.look || null, ready: !!p.ready }));
+// ---- social state (memory only) ----
+const users = new Map(), keys = new Map(), freqs = new Map(), facks = new Map();
+const info = ws => ({ uid: ws.uid, name: ws.name, lv: ws.lv || 1 });
+const UID = /^[A-Z2-9]{6}$/;
+function statusOf(uid) { const w = users.get(uid); if (!w || w.readyState !== 1) return { uid, on: false }; const r = rooms.get(w.room); return { uid, on: true, name: w.name, lv: w.lv || 1, st: r ? (r.started ? 'match' : r.quick ? 'search' : r.players.size > 1 ? 'party' : 'lobby') : 'menu' }; }
+function meta(ws, m) { if (m.name) ws.name = String(m.name).replace(/[<>]/g, '').slice(0, 12) || ws.name; if (m.lv) ws.lv = Math.max(1, Math.min(999, m.lv | 0)); if (m.look && typeof m.look === 'object') ws.look = { thobe: String(m.look.thobe || 'white').slice(0, 12), acc: String(m.look.acc || 'none').slice(0, 12), sandal: String(m.look.sandal || 'classic').slice(0, 12), trail: String(m.look.trail || 'none').slice(0, 12) }; }
 function stats() { const q = {}; MODES.forEach(m => q[m] = 0); for (const r of rooms.values()) if (r.quick && !r.started) q[r.mode] += r.players.size; return { online: wss.clients.size, playing: [...rooms.values()].filter(r => r.started).reduce((a, r) => a + r.players.size, 0), queue: q }; }
 function roomMsg(r) { return { t: 'room', code: r.quick ? '' : r.code, quick: r.quick, host: r.host, list: listOf(r), mode: r.mode, started: r.started, startsAt: r.startsAt ? r.startsAt - Date.now() : 0, online: wss.clients.size }; }
 function broadcast(r, o, except) { const s = JSON.stringify(o); for (const p of r.players.values()) if (p !== except && p.readyState === 1) p.send(s); }
@@ -81,6 +89,7 @@ function leave(ws, quiet) {
   if (!r.players.size) { clearTimeout(r.timer); rooms.delete(r.code); return; }
   pickHost(r);
   if (r.started) broadcast(r, { t: 'left', id: ws.id, host: r.host });
+  ws.ready = false;
   armQuick(r); sync(r);
 }
 function enter(ws, r) { leave(ws); r.players.set(ws.id, ws); ws.room = r.code; seats.set(ws.token, ws.id); if (!r.host) r.host = ws.id; armQuick(r); sync(r); }
@@ -94,17 +103,55 @@ wss.on('connection', ws => {
     const mode = MODES.includes(m.mode) ? m.mode : 'classic';
     if (m.t === 'ping') return send(ws, { t: 'pong', c: m.c, online: wss.clients.size });
     if (m.t === 'stats') return send(ws, Object.assign({ t: 'stats' }, stats()));
+    // ---------------- identity / friends / party ----------------
+    if (m.t === 'id') {
+      const uid = String(m.uid || '').toUpperCase(), key = String(m.key || '');
+      if (!UID.test(uid) || key.length < 16) return send(ws, { t: 'error', msg: 'هوية غير صالحة' });
+      const h = crypto.createHash('sha256').update(key).digest('hex');
+      if (keys.has(uid) && keys.get(uid) !== h) return send(ws, { t: 'idbad' });
+      keys.set(uid, h); ws.uid = uid; meta(ws, m); users.set(uid, ws);
+      send(ws, { t: 'me', uid });
+      const q = freqs.get(uid); if (q) for (const [from, inf] of q) send(ws, { t: 'freq', from: inf });
+      const a = facks.get(uid); if (a) { a.forEach(inf => send(ws, { t: 'fok', who: inf })); facks.delete(uid); }
+      const r = rooms.get(ws.room); if (r) sync(r);
+      return;
+    }
+    if (m.t === 'meta') { meta(ws, m); const r = rooms.get(ws.room); if (r) sync(r); return; }
+    if (m.t === 'ready') { ws.ready = !!m.v; const r = rooms.get(ws.room); if (r) sync(r); return; }
+    if (m.t === 'pres') { const l = (Array.isArray(m.uids) ? m.uids : []).slice(0, 200).map(u => statusOf(String(u))); return send(ws, { t: 'pres', list: l, online: wss.clients.size }); }
+    if (m.t === 'fadd') {
+      const to = String(m.code || '').toUpperCase().trim(); if (!ws.uid) return;
+      if (!UID.test(to)) return send(ws, { t: 'ferr', msg: 'الكود لازم 6 حروف/أرقام' });
+      if (to === ws.uid) return send(ws, { t: 'ferr', msg: 'هذا كودك أنت 😄' });
+      const q = freqs.get(to) || new Map(); q.set(ws.uid, info(ws)); freqs.set(to, q);
+      const w = users.get(to); if (w) send(w, { t: 'freq', from: info(ws) });
+      return send(ws, { t: 'fsent', uid: to, on: !!w, quiet: !!m.quiet });
+    }
+    if (m.t === 'facc' || m.t === 'fdec') {
+      const from = String(m.uid || '').toUpperCase(); if (!ws.uid) return; const q = freqs.get(ws.uid); if (q) { q.delete(from); if (!q.size) freqs.delete(ws.uid); }
+      if (m.t === 'facc') { const w = users.get(from); if (w) send(w, { t: 'fok', who: info(ws) }); else { const a = facks.get(from) || []; a.push(info(ws)); facks.set(from, a); } }
+      return;
+    }
+    if (m.t === 'pinv') {          // party invite: the friend joins my private room
+      const to = users.get(String(m.uid || '').toUpperCase()), r = rooms.get(ws.room);
+      if (!to) return send(ws, { t: 'ferr', msg: 'صديقك غير متصل الحين' });
+      if (!r || r.quick || r.started) return send(ws, { t: 'ferr', msg: 'افتح غرفتك أولًا' });
+      if (r.players.size >= 6) return send(ws, { t: 'ferr', msg: 'الفريق مكتمل (6)' });
+      send(to, { t: 'pinvite', from: info(ws), code: r.code, mode: r.mode }); return send(ws, { t: 'pinvsent', uid: to.uid });
+    }
+    if (m.t === 'pdec') { const w = users.get(String(m.uid || '').toUpperCase()); if (w) send(w, { t: 'pdeclined', name: ws.name }); return; }
+    if (m.t === 'kick') { const r = rooms.get(ws.room); if (!r || r.host !== ws.id || r.started) return; const p = r.players.get(m.id | 0); if (p && p !== ws) { leave(p); send(p, { t: 'kicked' }); } return; }
     if (m.t === 'create') {
-      ws.name = name(); const c = newCode(), r = { code: c, quick: false, players: new Map(), host: ws.id, mode, started: false };
+      ws.name = name(); meta(ws, m); ws.ready = false; const c = newCode(), r = { code: c, quick: false, players: new Map(), host: ws.id, mode, started: false };
       rooms.set(c, r); enter(ws, r);
     } else if (m.t === 'join') {
       const c = String(m.code || '').toUpperCase().trim(), r = rooms.get(c);
       if (!r || r.quick) return send(ws, { t: 'error', msg: 'الكود غير موجود' });
       if (r.players.size >= 6) return send(ws, { t: 'error', msg: 'الغرفة ممتلئة' });
       if (r.started) return send(ws, { t: 'error', msg: 'المباراة بدأت، انتظر تخلص' });
-      ws.name = name(); enter(ws, r);
+      ws.name = name(); meta(ws, m); ws.ready = false; enter(ws, r);
     } else if (m.t === 'quick') {
-      ws.name = name();
+      ws.name = name(); meta(ws, m); ws.ready = true;
       let r = [...rooms.values()].find(x => x.quick && !x.started && x.mode === mode && x.players.size < 6);
       if (!r) { const c = newCode(); r = { code: c, quick: true, players: new Map(), host: ws.id, mode, started: false }; rooms.set(c, r); }
       enter(ws, r);
@@ -113,7 +160,7 @@ wss.on('connection', ws => {
     } else if (m.t === 'start') {
       const r = rooms.get(ws.room); if (r && !r.quick && r.host === ws.id) { if (r.players.size < 2) return send(ws, { t: 'error', msg: 'بانتظار لاعب ثاني' }); startRoom(r); }
     } else if (m.t === 'lobby') {           // match finished: private room goes back to its lobby
-      const r = rooms.get(ws.room); if (!r) return; if (r.quick) { leave(ws); return; } if (r.started) { r.started = false; } sync(r);
+      const r = rooms.get(ws.room); if (!r) return; if (r.quick) { leave(ws); return; } if (r.started) { r.started = false; for (const p of r.players.values()) p.ready = false; } sync(r);
     } else if (m.t === 'relay') {
       const r = rooms.get(ws.room); if (!r) return;
       broadcast(r, { t: 'relay', from: ws.id, d: m.d }, ws);
@@ -122,12 +169,13 @@ wss.on('connection', ws => {
       for (const r of rooms.values()) { const p = id && r.players.get(id); if (p) { old = { r, p }; break; } }
       if (!old) return send(ws, { t: 'resume', ok: false });
       const { r, p } = old; clearTimeout(p.goneT); r.players.delete(p.id);
-      ws.id = p.id; ws.name = p.name; ws.token = p.token; ws.room = r.code; r.players.set(ws.id, ws); seats.set(ws.token, ws.id);
+      ws.id = p.id; ws.name = p.name; ws.token = p.token; ws.room = r.code; ws.uid = p.uid; ws.lv = p.lv; ws.look = p.look; r.players.set(ws.id, ws); seats.set(ws.token, ws.id); if (ws.uid && users.get(ws.uid) === p) users.set(ws.uid, ws);
       try { p.terminate(); } catch (e) { }
       send(ws, { t: 'resume', ok: true, id: ws.id }); sync(r);
     } else if (m.t === 'leave') leave(ws);
   });
   ws.on('close', () => {
+    if (ws.uid && users.get(ws.uid) === ws) users.delete(ws.uid);
     const r = rooms.get(ws.room); if (!r || !r.players.has(ws.id) || r.players.get(ws.id) !== ws) return;
     if (r.started) { ws.gone = true; sync(r); ws.goneT = setTimeout(() => { if (r.players.get(ws.id) === ws) leave(ws); }, 20000); }   // keep the seat 20 s
     else leave(ws);
